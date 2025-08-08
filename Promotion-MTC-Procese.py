@@ -293,7 +293,7 @@ def update_Toll_Transactions(config, transactions):
         for transaction in transactions:
             cursor.execute(SQL_Update, transaction.DMTPX_ID, transaction.DMTPX_TRX_DATETIME)
             updated_count += 1
-            logger.info(f"Transaction {transaction.DMTPX_ID} updated successfully.")
+            #logger.info(f"Transaction {transaction.DMTPX_ID} updated successfully.")
         conn.commit()
         cursor.close()
         conn.close()
@@ -313,12 +313,12 @@ def main(config):
     try:
         # Fetch transactions from Toll DB
         transactions = get_Toll_Transactions(config.get('Toll_DB'))
-        logger.info(f"Fetched {len(transactions)} transactions from the Toll database.")
+        #logger.info(f"Fetched {len(transactions)} transactions from the Toll database.")
         logger.debug(f"Transactions: {transactions}")
 
         # Fetch promotions from Promotion DB
         promotions = get_Promotion_Register(config.get('Promotion_DB'))
-        logger.info(f"Fetched {len(promotions)} promotions from the Promotion database.")
+        #logger.info(f"Fetched {len(promotions)} promotions from the Promotion database.")
         logger.debug(f"Promotions: {promotions}")
 
         # Match transactions with promotions
@@ -340,8 +340,10 @@ def main(config):
             logger.info(f"Inserting {len(matched_transactions)} matched transactions into the Promotion Toll database.")
             insert_Toll_Transactions(config.get('Promotion_DB'), matched_transactions)
             for t in matched_transactions:
-                logger.info(f"Transaction {t.DMTPX_ID} updated with promotion details.")
-                
+                logger.debug(f"Transaction {t.DMTPX_ID} updated with promotion details.")
+        else:
+            logger.info("No matched transactions to insert into the Promotion Toll database.")
+
         # Update the original transactions in the Toll database
         if transactions:    
             logger.info(f"Updating {len(transactions)} transactions in the Toll database.")
