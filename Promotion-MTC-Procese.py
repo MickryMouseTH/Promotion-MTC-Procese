@@ -1,4 +1,4 @@
-from loguru import logger
+from LogLibrary import Load_Config, Loguru_Logging
 import pyodbc
 import time
 import json
@@ -7,7 +7,7 @@ import sys
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Promotion-MTC-Procese"
-Program_Version = "1.0"
+Program_Version = "1.2"
 # ---------------------------------------------------------------------
 
 # Default configuration for database connections and logging
@@ -32,72 +32,13 @@ default_config = {
     },
     "RETRY_INTERVAL": 10,  # seconds
     "log_Level": "DEBUG",
-    "Log_Console_Enable": 1,
-    "log_Backup": 90,
-    "Log_Size": "10 MB",
+    "Log_Console": 1,         # Set to "true" to enable console logging.
+    "log_Backup": 90,         # Log retention duration (number of backup files).
+    "Log_Size": "10 MB"       # Maximum log file size before rotation. 
 }
 
-def Load_Config(default_config,Program_Name):
-    """
-    Load configuration from JSON file. If not found, create with default values.
-    """
-    config_file_path = f'{Program_Name}.config.json'
-
-    # Create config file with default values if it does not exist.
-    if not os.path.exists(config_file_path):
-        logger.warning("Configuration file not found. Creating a new one with default values.")
-        with open(config_file_path, 'w') as new_config_file:
-            json.dump(default_config, new_config_file, indent=4)
-
-    # Load configuration from file
-    with open(config_file_path, 'r') as config_file:
-        config = json.load(config_file)
-    
-    logger.debug(f"Configuration loaded: {config}")
-    return config
-
-# ----------------------- Loguru Logging Setup -----------------------
-def Loguru_Logging(config,Program_Name,Program_Version):
-    """
-    Configure Loguru logger for both file and console output.
-    """
-    logger.remove()
-
-    log_Backup = int(config.get('log_Backup', 90))  # Default to 90 days if not set
-    if log_Backup < 1:  # Ensure log retention is at least 1 day
-        log_Backup = 1
-    Log_Size = config.get('Log_Size', '10 MB')  # Default to 10 MB if not set
-    log_Level = config.get('log_Level', 'DEBUG').upper()  # Default to DEBUG if not set
-
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-
-    log_file_name = f'{Program_Name}_{Program_Version}.log'
-    log_file = os.path.join(log_dir, log_file_name)
-
-    # Add console logging if enabled
-    if config.get('Log_Console_Enable',0) == 1:
-        logger.add(
-            sys.stdout, 
-            level=log_Level, 
-            format="<green>{time}</green> | <blue>{level}</blue> | <cyan>{thread.id}</cyan> | <magenta>{function}</magenta> | {message}"
-        )
-
-    # Add file logging with rotation and retention
-    logger.add(
-        log_file,
-        format="{time} | {level} | {thread.id} | {function} | {message}",
-        level=log_Level,
-        rotation=Log_Size,
-        retention=log_Backup,
-        compression="zip"
-    )
-
-    logger.info('-' * 117)
-    logger.info(f"Start {Program_Name} Version {Program_Version}")
-    logger.info('-' * 117)
-
-    return logger
+config = Load_Config(default_config, Program_Name)
+logger = Loguru_Logging(config, Program_Name, Program_Version)
 
 def get_Tolldb_connection(config):
     """
@@ -187,6 +128,7 @@ def get_Toll_Transactions(config):
             AND dpt.DMTPX_TRX_DATETIME >= '{config.get('Start_Date','2025-08-01 00:00:00.000')}'
             AND dpt.DMTPX_TC_PAYMENTMETHOD_ID IN (1,2,3,4,17,18,19,20)
             AND (dpt.DMTPX_LICENCEPLATE IS NOT NULL or dpt.DMTPX_LICENCEPLATE <> '')
+            AND (dpt.DMTPX_PROVINCEID IS NOT NULL or dpt.DMTPX_PROVINCEID <> '')
             AND dpt.DMTPX_PROMOTION_DATE is null 
             ORDER BY dpt.DMTPX_TRX_DATETIME
         """
@@ -311,6 +253,14 @@ def main(config):
     """
     logger.debug(f"Using configuration: {config}")
     try:
+        def normalize_text(value):
+            """Return a safe normalized string: strip + lower, handling None."""
+            if value is None:
+                return ""
+            try:
+                return str(value).strip().lower()
+            except Exception:
+                return ""
         # Fetch transactions from Toll DB
         transactions = get_Toll_Transactions(config.get('Toll_DB'))
         #logger.info(f"Fetched {len(transactions)} transactions from the Toll database.")
@@ -324,11 +274,12 @@ def main(config):
         # Match transactions with promotions
         matched_transactions = []
         for transaction in transactions:
+            lp = normalize_text(getattr(transaction, "DMTPX_LICENCEPLATE", None))
+            prov = normalize_text(getattr(transaction, "DMTPX_PROVINCE", None))
             for promotion in promotions:
-                if (
-                    transaction.DMTPX_LICENCEPLATE.strip().lower() == promotion.LICENCE_PLATE.strip().lower() and
-                    transaction.DMTPX_PROVINCE.strip().lower() == promotion.PROVINCE.strip().lower()
-                ):
+                promo_lp = normalize_text(getattr(promotion, "LICENCE_PLATE", None))
+                promo_prov = normalize_text(getattr(promotion, "PROVINCE", None))
+                if lp and prov and (lp == promo_lp) and (prov == promo_prov):
                     logger.debug(
                         f"Promotion found for licence plate {transaction.DMTPX_LICENCEPLATE} in province {transaction.DMTPX_PROVINCE} in transaction {transaction.DMTPX_ID}."
                     )
@@ -355,14 +306,7 @@ def main(config):
         return 
 
 if __name__ == "__main__":
-    # Load configuration and set up logging
-    try:
-        config = Load_Config(default_config, Program_Name)
-        logger = Loguru_Logging(config, Program_Name, Program_Version)
-    except Exception as e:
-        logger.error(f"Error loading configuration or setting up logging: {e}")
-        sys.exit(1)
-
+    
     while True:
         try:
             main(config)
