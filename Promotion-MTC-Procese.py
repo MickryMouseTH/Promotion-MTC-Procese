@@ -4,10 +4,11 @@ import time
 import json
 import os
 import sys
+import csv
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Promotion-MTC-Procese"
-Program_Version = "1.3.0"
+Program_Version = "1.3.1"
 # ---------------------------------------------------------------------
 
 # Default configuration for database connections and logging
@@ -31,6 +32,8 @@ default_config = {
         "ODBC_Driver": "ODBC Driver 17 for SQL Server",
     },
     "RETRY_INTERVAL": 10,  # seconds
+    "Dry_Run": 0,                     # Set to 1 to run a single pass and export CSV instead of writing to the DB.
+    "Dry_Run_Dir": "dry_run_output",  # Output folder for dry-run CSV files.
     "log_Level": "DEBUG",
     "Log_Console": 1,         # Set to "true" to enable console logging.
     "log_Backup": 90,         # Log retention duration (number of backup files).
@@ -40,11 +43,26 @@ default_config = {
 config = Load_Config(default_config, Program_Name)
 logger = Loguru_Logging(config, Program_Name, Program_Version)
 
+def redact_config(value):
+    """
+    Return a copy of the configuration with any sensitive values (e.g. database
+    passwords) masked, so it is safe to write to the logs. Handles nested dicts.
+    """
+    if isinstance(value, dict):
+        redacted = {}
+        for key, val in value.items():
+            if isinstance(key, str) and ("PASSWORD" in key.upper() or "PWD" in key.upper()):
+                redacted[key] = "******" if val else val
+            else:
+                redacted[key] = redact_config(val)
+        return redacted
+    return value
+
 def get_Tolldb_connection(config):
     """
     Create and return a database connection object for the Toll database.
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         conn_str = (
             f"DRIVER={config.get('ODBC_Driver', 'ODBC Driver 17 for SQL Server')};"
@@ -68,7 +86,7 @@ def get_Promotiondb_connection(config):
     """
     Create and return a database connection object for the Promotion database.
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         conn_str = (
             f"DRIVER={config.get('ODBC_Driver', 'ODBC Driver 17 for SQL Server')};"
@@ -93,7 +111,7 @@ def get_Toll_Transactions(config):
     Fetch transactions from the Toll database.
     Returns a list of transaction rows.
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         logger.info("Fetching transactions from the Toll database...")
         conn = get_Tolldb_connection(config)
@@ -152,7 +170,7 @@ def get_Promotion_Register(config):
     Fetch promotion register from the Promotion database.
     Returns a list of promotion rows.
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         logger.info("Fetching promotion register from the Promotion database...")
         conn = get_Promotiondb_connection(config)
@@ -183,7 +201,7 @@ def insert_Toll_Transactions(config, transactions):
     Insert transactions into the Promotion Toll database.
     Skips transactions that already exist (by TRANS_NO).
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
 
     SQL_Insert = """
     INSERT INTO PROMOTION_TOLL
@@ -225,7 +243,7 @@ def update_Toll_Transactions(config, transactions):
     """
     Update specific transactions in the Toll database to set DMTPX_PROMOTION_DATE.
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
     conn = None
     try:
         conn = get_Tolldb_connection(config)
@@ -256,14 +274,42 @@ def update_Toll_Transactions(config, transactions):
         if conn:
             conn.close()
 
-def main(config):
+def export_Transactions_CSV(transactions, columns, file_path):
+    """
+    Write the given transactions to a CSV file using the provided columns.
+    Used by dry-run mode to preview INSERT/UPDATE data without touching the DB.
+    Returns the number of rows written.
+    """
+    try:
+        # Make sure the output directory exists.
+        directory = os.path.dirname(file_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            for transaction in transactions:
+                writer.writerow([getattr(transaction, col, "") for col in columns])
+
+        logger.info(f"[DRY-RUN] Wrote {len(transactions)} rows to {file_path}")
+        return len(transactions)
+    except Exception as e:
+        logger.error(f"[DRY-RUN] Error writing CSV file {file_path}: {e}")
+        return 0
+
+def main(config, dry_run=False):
     """
     Main function to process transactions:
     - Fetch transactions and promotions
     - Match and insert promotions
     - Update matched transactions in Toll DB
+
+    When dry_run is True, no INSERT/UPDATE is performed against the databases.
+    Instead, the matched (would-be-inserted) and the to-be-updated transactions
+    are exported to CSV files for review.
     """
-    logger.debug(f"Using configuration: {config}")
+    logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         def normalize_text(value):
             """Return a safe normalized string: strip + lower, handling None."""
@@ -304,6 +350,30 @@ def main(config):
                 )
                 matched_transactions.append(transaction)
 
+        if dry_run:
+            # Dry-run mode: export to CSV instead of writing to the databases.
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_dir = config.get('Dry_Run_Dir', 'dry_run_output')
+
+            # Columns that would be INSERTed into PROMOTION_TOLL.
+            insert_columns = [
+                "ID", "DMTPX_TRX_DATETIME", "DMTPX_TSB_ID", "DMTPX_PLAZA_ID",
+                "DMTPX_LANE_ID", "DMTPX_PRICE_IN_CURRENCY", "DMTPX_LICENCEPLATE",
+                "DMTPX_PROVINCE", "DMTPX_RECEIPT_NO", "DMTPX_TC_PAYMENTMETHOD_ID",
+            ]
+            insert_file = os.path.join(output_dir, f"dry_run_insert_{timestamp}.csv")
+            export_Transactions_CSV(matched_transactions, insert_columns, insert_file)
+            logger.info(f"[DRY-RUN] {len(matched_transactions)} matched transactions would be INSERTed into the Promotion Toll database.")
+
+            # Columns that would be UPDATEd in DMT_PASSING_TRANSACTION.
+            update_columns = ["DMTPX_ID", "DMTPX_TRX_DATETIME"]
+            update_file = os.path.join(output_dir, f"dry_run_update_{timestamp}.csv")
+            export_Transactions_CSV(transactions, update_columns, update_file)
+            logger.info(f"[DRY-RUN] {len(transactions)} transactions would be UPDATEd in the Toll database.")
+
+            logger.info("[DRY-RUN] Completed. No changes were written to any database.")
+            return
+
         # Insert matched transactions into Promotion Toll DB
         if matched_transactions:
             logger.info(f"Inserting {len(matched_transactions)} matched transactions into the Promotion Toll database.")
@@ -314,7 +384,7 @@ def main(config):
             logger.info("No matched transactions to insert into the Promotion Toll database.")
 
         # Update the original transactions in the Toll database
-        if transactions:    
+        if transactions:
             logger.info(f"Updating {len(transactions)} transactions in the Toll database.")
             update_Toll_Transactions(config.get('Toll_DB'), transactions)
 
@@ -324,7 +394,23 @@ def main(config):
         return 
 
 if __name__ == "__main__":
-    
+
+    # Dry-run mode: run a single pass and export CSV files instead of
+    # writing INSERT/UPDATE to the databases. Enabled via the "Dry_Run" config
+    # key; the --dry-run / -d command-line flag also forces it on.
+    dry_run = str(config.get('Dry_Run', 0)) == "1" \
+        or any(arg in ("--dry-run", "-d") for arg in sys.argv[1:])
+
+    if dry_run:
+        logger.info("Starting in DRY-RUN mode: a single pass will run and CSV files will be generated instead of writing to the databases.")
+        try:
+            main(config, dry_run=True)
+        except KeyboardInterrupt:
+            logger.info("Dry-run interrupted by user. Shutting down.")
+        except Exception as e:
+            logger.critical(f"An unhandled exception occurred during the dry-run: {e}", exc_info=True)
+        sys.exit(0)
+
     while True:
         try:
             main(config)
