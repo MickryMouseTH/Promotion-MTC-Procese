@@ -119,7 +119,7 @@ Promotion-MTC-Procese.py        # โปรแกรมหลัก (วนท�
 
 ```bash
 # 1) ติดตั้ง dependency
-pip install pyodbc loguru cryptography
+pip install -r requirements.txt
 
 # 2) รันครั้งแรกเพื่อสร้างไฟล์ config (จะได้ค่าว่าง)
 python Promotion-MTC-Procese.py
@@ -133,7 +133,35 @@ python Promotion-MTC-Procese.py
 
 ---
 
-## 7. ตารางฐานข้อมูลที่เกี่ยวข้อง
+## 7. Build เป็น executable ไฟล์เดียว (PyInstaller `--onefile`)
+
+| ไฟล์ | ใช้บน |
+|------|-------|
+| `requirements.txt` | รายการ dependency สำหรับ runtime |
+| `build.sh` | สร้าง executable บน **macOS / Linux** |
+| `build.bat` | สร้าง executable บน **Windows** |
+
+```bash
+# macOS / Linux
+./build.sh
+
+# Windows
+build.bat
+```
+
+ผลลัพธ์จะอยู่ที่ `dist/Promotion-MTC-Procese` (หรือ `.exe` บน Windows)
+
+> สคริปต์จะติดตั้ง dependency + PyInstaller ให้อัตโนมัติ แล้วสั่ง build ด้วย
+> `--onefile` พร้อม `--collect-submodules cryptography` และ `--hidden-import pyodbc`
+> เพื่อให้แพ็กเกจเข้ารหัสและ ODBC ถูกรวมเข้าไปครบ
+>
+> **สำคัญ:** เมื่อรัน executable ไฟล์ `config.json`, `*.key` และโฟลเดอร์ `logs/`
+> จะถูกสร้าง/อ่านจากตำแหน่งเดียวกับตัว executable (รองรับ `sys.frozen` ใน `LogLibrary.py`)
+> ดังนั้นควรวาง executable ไว้ในโฟลเดอร์ที่เขียนไฟล์ได้
+
+---
+
+## 8. ตารางฐานข้อมูลที่เกี่ยวข้อง
 
 | ฐานข้อมูล | ตาราง | บทบาท |
 |-----------|-------|-------|

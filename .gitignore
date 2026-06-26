@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Application runtime files (generated, may contain secrets)
+*_config.json
+*_config.json.bak
+*.key
+*.key.bak
+logs/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
