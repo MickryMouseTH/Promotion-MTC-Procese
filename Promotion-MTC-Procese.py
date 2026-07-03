@@ -8,7 +8,7 @@ import csv
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Promotion-MTC-Procese"
-Program_Version = "1.3.2"
+Program_Version = "1.3.3"
 # ---------------------------------------------------------------------
 
 # Default configuration for database connections and logging
@@ -32,6 +32,8 @@ default_config = {
         "ODBC_Driver": "ODBC Driver 17 for SQL Server",
     },
     "RETRY_INTERVAL": 10,  # seconds
+    "Deadlock_Max_Retry": 3,          # How many times to retry a single row that hits a SQL Server deadlock (1205).
+    "Deadlock_Retry_Delay": 1,        # Seconds to wait between deadlock retries.
     "Dry_Run": 0,                     # Set to 1 to run a single pass and export CSV instead of writing to the DB.
     "Dry_Run_Dir": "dry_run_output",  # Output folder for dry-run CSV files.
     "log_Level": "DEBUG",
@@ -42,6 +44,16 @@ default_config = {
 
 config = Load_Config(default_config, Program_Name)
 logger = Loguru_Logging(config, Program_Name, Program_Version)
+
+# How aggressively to retry a single row that hits a SQL Server deadlock (1205).
+try:
+    DEADLOCK_MAX_RETRY = int(config.get('Deadlock_Max_Retry', 3))
+except (TypeError, ValueError):
+    DEADLOCK_MAX_RETRY = 3
+try:
+    DEADLOCK_RETRY_DELAY = float(config.get('Deadlock_Retry_Delay', 1))
+except (TypeError, ValueError):
+    DEADLOCK_RETRY_DELAY = 1.0
 
 def redact_config(value):
     """
@@ -60,13 +72,49 @@ def redact_config(value):
 
 def is_duplicate_key_error(exc):
     """
-    Return True if the given exception is a SQL Server duplicate-key violation
-    (PRIMARY KEY / UNIQUE constraint 2627, or unique index 2601). Such an error
-    means the row already exists in the target table, which we treat as a
-    successful "already processed" case rather than a failure.
+    Return True only for a SQL Server duplicate-key violation: SQLSTATE 23000
+    (integrity constraint violation) together with native error 2627 (PRIMARY
+    KEY / UNIQUE constraint) or 2601 (unique index). Such an error means the row
+    already exists in the target table, which we treat as a successful "already
+    processed" case rather than a failure.
+
+    Other errors are intentionally NOT matched. In particular a deadlock
+    (native error 1205, SQLSTATE 40001) must be treated as a real failure so the
+    row is retried and NOT marked as processed in the Toll DB. The native code
+    is matched inside parentheses -- "(2627)" -- so an unrelated number in the
+    message (e.g. a process id in a deadlock message) cannot cause a false hit.
     """
-    text = str(exc)
-    return "2627" in text or "2601" in text
+    args = getattr(exc, "args", None) or ()
+    sqlstate = args[0] if args else None
+    message = str(exc)
+    return sqlstate == "23000" and ("(2627)" in message or "(2601)" in message)
+
+def is_deadlock_error(exc):
+    """
+    Return True if the exception is a SQL Server deadlock victim error
+    (native error 1205, SQLSTATE 40001). A deadlock is transient: the
+    transaction was rolled back and can simply be retried.
+    """
+    args = getattr(exc, "args", None) or ()
+    sqlstate = args[0] if args else None
+    message = str(exc)
+    return sqlstate == "40001" or "(1205)" in message
+
+def apply_deadlock_prevention(cursor):
+    """
+    Reduce the chance (and impact) of deadlocks for this batch job:
+
+    - SET DEADLOCK_PRIORITY LOW: if a deadlock does occur, SQL Server picks
+      THIS session as the victim, so the live toll/OLTP system is never rolled
+      back on our account. We just retry (see is_deadlock_error handling).
+
+    Best-effort only: if the session setting cannot be applied we log and carry
+    on, since the retry logic still protects correctness.
+    """
+    try:
+        cursor.execute("SET DEADLOCK_PRIORITY LOW;")
+    except Exception as e:
+        logger.warning(f"Could not set DEADLOCK_PRIORITY LOW: {e}")
 
 def get_Tolldb_connection(config):
     """
@@ -235,52 +283,70 @@ def insert_Toll_Transactions(config, transactions):
             return processed
 
         cursor = conn.cursor()
+        # Deadlock prevention: mark this batch job as the preferred deadlock
+        # victim so the live toll system always wins; we simply retry.
+        apply_deadlock_prevention(cursor)
         total = len(transactions)
         inserted_count = 0   # newly inserted rows
         existing_count = 0   # already present (found by the existence check)
         dup_count = 0        # duplicate-key on insert (already present, race/prior run)
         failed_count = 0     # real failures (will be retried next run)
+        deadlock_retry_total = 0  # total deadlock retries across all rows
         logger.info(f"Starting insert into Promotion Toll database: {total} matched transaction(s) to process.")
 
         for index, transaction in enumerate(transactions, start=1):
             trans_id = getattr(transaction, 'ID', '?')
             plate = getattr(transaction, 'DMTPX_LICENCEPLATE', '?')
             province = getattr(transaction, 'DMTPX_PROVINCE', '?')
-            try:
-                cursor.execute(SQL_Check, transaction.ID)
-                exists = cursor.fetchone()[0]
-                if exists:
-                    existing_count += 1
-                    processed.append(transaction)
-                    logger.info(f"[{index}/{total}] Transaction {trans_id} (plate={plate}, province={province}) already exists. Skipping insert.")
-                    continue
-                cursor.execute(SQL_Insert, transaction.ID, transaction.DMTPX_TRX_DATETIME, transaction.DMTPX_TSB_ID, transaction.DMTPX_PLAZA_ID, transaction.DMTPX_LANE_ID, transaction.DMTPX_PRICE_IN_CURRENCY, transaction.DMTPX_LICENCEPLATE, transaction.DMTPX_PROVINCE, transaction.DMTPX_RECEIPT_NO, transaction.DMTPX_TC_PAYMENTMETHOD_ID)
-                # Commit this single row so a later failure cannot undo it.
-                conn.commit()
-                inserted_count += 1
-                processed.append(transaction)
-                logger.info(f"[{index}/{total}] Inserted transaction {trans_id} (plate={plate}, province={province}) into Promotion Toll database and committed.")
-            except Exception as e:
-                # Roll back this row's failed statement first.
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
-                    conn.rollback()
-                except Exception as rb_err:
-                    logger.warning(f"[{index}/{total}] Rollback failed for transaction {trans_id}: {rb_err}")
-                if is_duplicate_key_error(e):
-                    # The row already exists in PROMOTION_TOLL (e.g. inserted by
-                    # a previous run, or a race with the existence check above).
-                    # Treat it as processed so the Toll DB still gets updated.
-                    dup_count += 1
+                    cursor.execute(SQL_Check, transaction.ID)
+                    exists = cursor.fetchone()[0]
+                    if exists:
+                        existing_count += 1
+                        processed.append(transaction)
+                        logger.info(f"[{index}/{total}] Transaction {trans_id} (plate={plate}, province={province}) already exists. Skipping insert.")
+                        break
+                    cursor.execute(SQL_Insert, transaction.ID, transaction.DMTPX_TRX_DATETIME, transaction.DMTPX_TSB_ID, transaction.DMTPX_PLAZA_ID, transaction.DMTPX_LANE_ID, transaction.DMTPX_PRICE_IN_CURRENCY, transaction.DMTPX_LICENCEPLATE, transaction.DMTPX_PROVINCE, transaction.DMTPX_RECEIPT_NO, transaction.DMTPX_TC_PAYMENTMETHOD_ID)
+                    # Commit this single row so a later failure cannot undo it.
+                    conn.commit()
+                    inserted_count += 1
                     processed.append(transaction)
-                    logger.info(f"[{index}/{total}] Transaction {trans_id} (plate={plate}, province={province}) already exists (duplicate key). Treating as processed.")
-                else:
-                    # Keep going with the rest; this row will be retried next run.
+                    logger.info(f"[{index}/{total}] Inserted transaction {trans_id} (plate={plate}, province={province}) into Promotion Toll database and committed.")
+                    break
+                except Exception as e:
+                    # Roll back this row's failed statement first.
+                    try:
+                        conn.rollback()
+                    except Exception as rb_err:
+                        logger.warning(f"[{index}/{total}] Rollback failed for transaction {trans_id}: {rb_err}")
+                    if is_duplicate_key_error(e):
+                        # The row already exists in PROMOTION_TOLL (e.g. inserted
+                        # by a previous run, or a race with the existence check).
+                        # Treat it as processed so the Toll DB still gets updated.
+                        dup_count += 1
+                        processed.append(transaction)
+                        logger.info(f"[{index}/{total}] Transaction {trans_id} (plate={plate}, province={province}) already exists (duplicate key). Treating as processed.")
+                        break
+                    if is_deadlock_error(e) and attempt <= DEADLOCK_MAX_RETRY:
+                        # Deadlock is transient: wait briefly and retry this row.
+                        deadlock_retry_total += 1
+                        logger.warning(f"[{index}/{total}] Deadlock inserting transaction {trans_id} (attempt {attempt}/{DEADLOCK_MAX_RETRY + 1}). Retrying in {DEADLOCK_RETRY_DELAY}s...")
+                        time.sleep(DEADLOCK_RETRY_DELAY)
+                        continue
+                    # Real failure (or deadlock retries exhausted); retry next run.
                     failed_count += 1
-                    logger.error(f"[{index}/{total}] Error inserting transaction {trans_id} (plate={plate}, province={province}): {e}")
+                    if is_deadlock_error(e):
+                        logger.error(f"[{index}/{total}] Deadlock persisted after {DEADLOCK_MAX_RETRY} retries for transaction {trans_id} (plate={plate}, province={province}): {e}")
+                    else:
+                        logger.error(f"[{index}/{total}] Error inserting transaction {trans_id} (plate={plate}, province={province}): {e}")
+                    break
         logger.info(
             f"Insert summary (Promotion Toll DB): total={total}, inserted={inserted_count}, "
             f"already_existed={existing_count}, duplicate_key={dup_count}, failed={failed_count}, "
-            f"processed(safe_to_update)={len(processed)}."
+            f"deadlock_retries={deadlock_retry_total}, processed(safe_to_update)={len(processed)}."
         )
         if failed_count:
             logger.warning(f"{failed_count} transaction(s) failed to insert and will be retried on the next run.")
@@ -308,6 +374,8 @@ def update_Toll_Transactions(config, transactions):
             return
 
         cursor = conn.cursor()
+        # Deadlock prevention: yield to the live toll system if a deadlock hits.
+        apply_deadlock_prevention(cursor)
         SQL_Update = """
             UPDATE DMT_PASSING_TRANSACTION
             SET DMTPX_PROMOTION_DATE = getdate()
@@ -318,34 +386,49 @@ def update_Toll_Transactions(config, transactions):
         updated_count = 0
         notfound_count = 0
         failed_count = 0
+        deadlock_retry_total = 0
         logger.info(f"Starting update of DMTPX_PROMOTION_DATE in Toll database: {total} transaction(s) to process.")
 
         for index, transaction in enumerate(transactions, start=1):
             dmtpx_id = getattr(transaction, 'DMTPX_ID', '?')
             trx_dt = getattr(transaction, 'DMTPX_TRX_DATETIME', '?')
-            try:
-                cursor.execute(SQL_Update, transaction.DMTPX_ID, transaction.DMTPX_TRX_DATETIME)
-                affected = cursor.rowcount
-                # Commit this single row so a later failure cannot undo it.
-                conn.commit()
-                if affected and affected > 0:
-                    updated_count += 1
-                    logger.debug(f"[{index}/{total}] Updated transaction DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}), rows affected={affected}.")
-                else:
-                    # No matching row (already updated, or datetime mismatch).
-                    notfound_count += 1
-                    logger.warning(f"[{index}/{total}] No matching row to update for DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}); rows affected=0.")
-            except Exception as e:
-                # Roll back only this row and keep going with the rest.
-                failed_count += 1
-                logger.error(f"[{index}/{total}] Error updating transaction DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}): {e}")
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
-                    conn.rollback()
-                except Exception as rb_err:
-                    logger.warning(f"[{index}/{total}] Rollback failed for DMTPX_ID={dmtpx_id}: {rb_err}")
+                    cursor.execute(SQL_Update, transaction.DMTPX_ID, transaction.DMTPX_TRX_DATETIME)
+                    affected = cursor.rowcount
+                    # Commit this single row so a later failure cannot undo it.
+                    conn.commit()
+                    if affected and affected > 0:
+                        updated_count += 1
+                        logger.debug(f"[{index}/{total}] Updated transaction DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}), rows affected={affected}.")
+                    else:
+                        # No matching row (already updated, or datetime mismatch).
+                        notfound_count += 1
+                        logger.warning(f"[{index}/{total}] No matching row to update for DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}); rows affected=0.")
+                    break
+                except Exception as e:
+                    # Roll back only this row and keep going with the rest.
+                    try:
+                        conn.rollback()
+                    except Exception as rb_err:
+                        logger.warning(f"[{index}/{total}] Rollback failed for DMTPX_ID={dmtpx_id}: {rb_err}")
+                    if is_deadlock_error(e) and attempt <= DEADLOCK_MAX_RETRY:
+                        # Deadlock is transient: wait briefly and retry this row.
+                        deadlock_retry_total += 1
+                        logger.warning(f"[{index}/{total}] Deadlock updating DMTPX_ID={dmtpx_id} (attempt {attempt}/{DEADLOCK_MAX_RETRY + 1}). Retrying in {DEADLOCK_RETRY_DELAY}s...")
+                        time.sleep(DEADLOCK_RETRY_DELAY)
+                        continue
+                    failed_count += 1
+                    if is_deadlock_error(e):
+                        logger.error(f"[{index}/{total}] Deadlock persisted after {DEADLOCK_MAX_RETRY} retries updating DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}): {e}")
+                    else:
+                        logger.error(f"[{index}/{total}] Error updating transaction DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}): {e}")
+                    break
         logger.info(
             f"Update summary (Toll DB): total={total}, updated={updated_count}, "
-            f"no_match={notfound_count}, failed={failed_count}."
+            f"no_match={notfound_count}, failed={failed_count}, deadlock_retries={deadlock_retry_total}."
         )
         if failed_count:
             logger.warning(f"{failed_count} transaction(s) failed to update in the Toll database.")
@@ -492,6 +575,13 @@ def main(config, dry_run=False):
         # Update the original transactions in the Toll database, skipping the
         # matched ones that failed to insert above.
         transactions_to_update = [t for t in transactions if t.ID not in failed_ids]
+        # Deadlock prevention: always acquire row locks in a consistent order
+        # (by primary key DMTPX_ID) so concurrent runs/sessions cannot form a
+        # lock cycle with each other.
+        try:
+            transactions_to_update.sort(key=lambda t: getattr(t, "DMTPX_ID", 0))
+        except Exception as sort_err:
+            logger.warning(f"Could not sort transactions for update ordering: {sort_err}")
         skipped = len(transactions) - len(transactions_to_update)
         logger.info(
             f"Preparing Toll DB update: {len(transactions_to_update)} transaction(s) will be marked as processed, "
