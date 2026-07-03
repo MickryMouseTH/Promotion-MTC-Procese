@@ -8,7 +8,7 @@ import csv
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Promotion-MTC-Procese"
-Program_Version = "1.3.3"
+Program_Version = "1.3.4"
 # ---------------------------------------------------------------------
 
 # Default configuration for database connections and logging
@@ -167,15 +167,19 @@ def get_Promotiondb_connection(config):
 def get_Toll_Transactions(config):
     """
     Fetch transactions from the Toll database.
-    Returns a list of transaction rows.
+
+    Returns a list of transaction rows on success (which may be empty when
+    there genuinely are no rows). Returns None on ANY error (no connection or
+    query failure) so the caller can tell "nothing to do" apart from "could not
+    read" and abort instead of marking data as processed.
     """
     logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         logger.info("Fetching transactions from the Toll database...")
         conn = get_Tolldb_connection(config)
         if not conn:
-            logger.error("No connection to Toll database. Returning empty list.")
-            return []
+            logger.error("No connection to Toll database. Aborting fetch.")
+            return None
 
         cursor = conn.cursor()
         SQL_Select = f"""
@@ -221,20 +225,25 @@ def get_Toll_Transactions(config):
 
     except Exception as e:
         logger.error(f"Error fetching transactions: {e}")
-        return []
-    
+        return None
+
 def get_Promotion_Register(config):
     """
     Fetch promotion register from the Promotion database.
-    Returns a list of promotion rows.
+
+    Returns a list of promotion rows on success (which may be empty when there
+    genuinely are no active promotions). Returns None on ANY error (no
+    connection or query failure), so the caller MUST NOT proceed to mark
+    transactions as processed -- otherwise transactions would be flagged as
+    "checked" without ever being compared against the register.
     """
     logger.debug(f"Using configuration: {redact_config(config)}")
     try:
         logger.info("Fetching promotion register from the Promotion database...")
         conn = get_Promotiondb_connection(config)
         if not conn:
-            logger.error("No connection to Promotion database. Returning empty list.")
-            return []
+            logger.error("No connection to Promotion database. Aborting fetch.")
+            return None
 
         cursor = conn.cursor()
         SQL_Select = """
@@ -252,7 +261,7 @@ def get_Promotion_Register(config):
 
     except Exception as e:
         logger.error(f"Error fetching promotions: {e}")
-        return []
+        return None
     
 def insert_Toll_Transactions(config, transactions):
     """
@@ -486,14 +495,23 @@ def main(config, dry_run=False):
                 return str(value).strip().lower()
             except Exception:
                 return ""
-        # Fetch transactions from Toll DB
+        # Fetch transactions from Toll DB. None means the fetch errored (as
+        # opposed to an empty list, which means there is genuinely nothing to
+        # do). On error we abort without touching either database.
         transactions = get_Toll_Transactions(config.get('Toll_DB'))
-        #logger.info(f"Fetched {len(transactions)} transactions from the Toll database.")
+        if transactions is None:
+            logger.error("Aborting run: could not fetch transactions from the Toll database. No changes were made.")
+            return
         logger.debug(f"Transactions: {transactions}")
 
-        # Fetch promotions from Promotion DB
+        # Fetch promotions from Promotion DB. If this errors we MUST abort:
+        # proceeding would leave promotion_keys empty, match nothing, and then
+        # mark every transaction as processed in the Toll DB even though it was
+        # never actually checked against the promotion register.
         promotions = get_Promotion_Register(config.get('Promotion_DB'))
-        #logger.info(f"Fetched {len(promotions)} promotions from the Promotion database.")
+        if promotions is None:
+            logger.error("Aborting run: could not fetch the promotion register. Toll DB will NOT be updated, so unchecked transactions are not lost.")
+            return
         logger.debug(f"Promotions: {promotions}")
 
         # Build a lookup set of (licence_plate, province) once so matching is
