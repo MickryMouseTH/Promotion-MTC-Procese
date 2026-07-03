@@ -8,7 +8,7 @@ import csv
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Promotion-MTC-Procese"
-Program_Version = "1.3.1"
+Program_Version = "1.3.2"
 # ---------------------------------------------------------------------
 
 # Default configuration for database connections and logging
@@ -57,6 +57,16 @@ def redact_config(value):
                 redacted[key] = redact_config(val)
         return redacted
     return value
+
+def is_duplicate_key_error(exc):
+    """
+    Return True if the given exception is a SQL Server duplicate-key violation
+    (PRIMARY KEY / UNIQUE constraint 2627, or unique index 2601). Such an error
+    means the row already exists in the target table, which we treat as a
+    successful "already processed" case rather than a failure.
+    """
+    text = str(exc)
+    return "2627" in text or "2601" in text
 
 def get_Tolldb_connection(config):
     """
@@ -198,8 +208,14 @@ def get_Promotion_Register(config):
     
 def insert_Toll_Transactions(config, transactions):
     """
-    Insert transactions into the Promotion Toll database.
-    Skips transactions that already exist (by TRANS_NO).
+    Insert transactions into the Promotion Toll database, one record at a time.
+    Each row is checked (by TRANS_NO) and committed individually, so a failure
+    on one row does not roll back rows that were already inserted successfully.
+
+    Returns the list of transactions that were successfully inserted or already
+    present in the Promotion Toll database. These are the only ones that are
+    safe to mark as processed in the Toll DB; rows that failed to insert are
+    left out so they can be retried on the next run.
     """
     logger.debug(f"Using configuration: {redact_config(config)}")
 
@@ -210,26 +226,64 @@ def insert_Toll_Transactions(config, transactions):
     """
     SQL_Check = "SELECT COUNT(1) FROM PROMOTION_TOLL WHERE TRANS_NO = ?"
 
+    processed = []
     conn = None
     try:
         conn = get_Promotiondb_connection(config)
         if not conn:
             logger.error("No connection to Promotion database. Insert aborted.")
-            return
+            return processed
 
         cursor = conn.cursor()
-        inserted_count = 0
-        for transaction in transactions:
-            cursor.execute(SQL_Check, transaction.ID)
-            exists = cursor.fetchone()[0]
-            if exists:
-                logger.info(f"Transaction {transaction.ID} already exists. Skipping insert.")
-                continue
-            cursor.execute(SQL_Insert, transaction.ID, transaction.DMTPX_TRX_DATETIME, transaction.DMTPX_TSB_ID, transaction.DMTPX_PLAZA_ID, transaction.DMTPX_LANE_ID, transaction.DMTPX_PRICE_IN_CURRENCY, transaction.DMTPX_LICENCEPLATE, transaction.DMTPX_PROVINCE, transaction.DMTPX_RECEIPT_NO, transaction.DMTPX_TC_PAYMENTMETHOD_ID)
-            inserted_count += 1
-            logger.debug(f"Inserted transaction {transaction.ID} into Promotion Toll database.")
-        conn.commit()
-        logger.info(f"Inserted {inserted_count} new transactions into the Toll database.")
+        total = len(transactions)
+        inserted_count = 0   # newly inserted rows
+        existing_count = 0   # already present (found by the existence check)
+        dup_count = 0        # duplicate-key on insert (already present, race/prior run)
+        failed_count = 0     # real failures (will be retried next run)
+        logger.info(f"Starting insert into Promotion Toll database: {total} matched transaction(s) to process.")
+
+        for index, transaction in enumerate(transactions, start=1):
+            trans_id = getattr(transaction, 'ID', '?')
+            plate = getattr(transaction, 'DMTPX_LICENCEPLATE', '?')
+            province = getattr(transaction, 'DMTPX_PROVINCE', '?')
+            try:
+                cursor.execute(SQL_Check, transaction.ID)
+                exists = cursor.fetchone()[0]
+                if exists:
+                    existing_count += 1
+                    processed.append(transaction)
+                    logger.info(f"[{index}/{total}] Transaction {trans_id} (plate={plate}, province={province}) already exists. Skipping insert.")
+                    continue
+                cursor.execute(SQL_Insert, transaction.ID, transaction.DMTPX_TRX_DATETIME, transaction.DMTPX_TSB_ID, transaction.DMTPX_PLAZA_ID, transaction.DMTPX_LANE_ID, transaction.DMTPX_PRICE_IN_CURRENCY, transaction.DMTPX_LICENCEPLATE, transaction.DMTPX_PROVINCE, transaction.DMTPX_RECEIPT_NO, transaction.DMTPX_TC_PAYMENTMETHOD_ID)
+                # Commit this single row so a later failure cannot undo it.
+                conn.commit()
+                inserted_count += 1
+                processed.append(transaction)
+                logger.info(f"[{index}/{total}] Inserted transaction {trans_id} (plate={plate}, province={province}) into Promotion Toll database and committed.")
+            except Exception as e:
+                # Roll back this row's failed statement first.
+                try:
+                    conn.rollback()
+                except Exception as rb_err:
+                    logger.warning(f"[{index}/{total}] Rollback failed for transaction {trans_id}: {rb_err}")
+                if is_duplicate_key_error(e):
+                    # The row already exists in PROMOTION_TOLL (e.g. inserted by
+                    # a previous run, or a race with the existence check above).
+                    # Treat it as processed so the Toll DB still gets updated.
+                    dup_count += 1
+                    processed.append(transaction)
+                    logger.info(f"[{index}/{total}] Transaction {trans_id} (plate={plate}, province={province}) already exists (duplicate key). Treating as processed.")
+                else:
+                    # Keep going with the rest; this row will be retried next run.
+                    failed_count += 1
+                    logger.error(f"[{index}/{total}] Error inserting transaction {trans_id} (plate={plate}, province={province}): {e}")
+        logger.info(
+            f"Insert summary (Promotion Toll DB): total={total}, inserted={inserted_count}, "
+            f"already_existed={existing_count}, duplicate_key={dup_count}, failed={failed_count}, "
+            f"processed(safe_to_update)={len(processed)}."
+        )
+        if failed_count:
+            logger.warning(f"{failed_count} transaction(s) failed to insert and will be retried on the next run.")
 
     except Exception as e:
         logger.error(f"Error inserting transactions: {e}")
@@ -238,6 +292,8 @@ def insert_Toll_Transactions(config, transactions):
     finally:
         if conn:
             conn.close()
+
+    return processed
 
 def update_Toll_Transactions(config, transactions):
     """
@@ -258,13 +314,41 @@ def update_Toll_Transactions(config, transactions):
             WHERE DMTPX_ID = ?
             and DMTPX_TRX_DATETIME = ?
         """
+        total = len(transactions)
         updated_count = 0
-        for transaction in transactions:
-            cursor.execute(SQL_Update, transaction.DMTPX_ID, transaction.DMTPX_TRX_DATETIME)
-            updated_count += 1
-            #logger.info(f"Transaction {transaction.DMTPX_ID} updated successfully.")
-        conn.commit()
-        logger.info(f"Updated {updated_count} transactions in the Toll database.")
+        notfound_count = 0
+        failed_count = 0
+        logger.info(f"Starting update of DMTPX_PROMOTION_DATE in Toll database: {total} transaction(s) to process.")
+
+        for index, transaction in enumerate(transactions, start=1):
+            dmtpx_id = getattr(transaction, 'DMTPX_ID', '?')
+            trx_dt = getattr(transaction, 'DMTPX_TRX_DATETIME', '?')
+            try:
+                cursor.execute(SQL_Update, transaction.DMTPX_ID, transaction.DMTPX_TRX_DATETIME)
+                affected = cursor.rowcount
+                # Commit this single row so a later failure cannot undo it.
+                conn.commit()
+                if affected and affected > 0:
+                    updated_count += 1
+                    logger.debug(f"[{index}/{total}] Updated transaction DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}), rows affected={affected}.")
+                else:
+                    # No matching row (already updated, or datetime mismatch).
+                    notfound_count += 1
+                    logger.warning(f"[{index}/{total}] No matching row to update for DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}); rows affected=0.")
+            except Exception as e:
+                # Roll back only this row and keep going with the rest.
+                failed_count += 1
+                logger.error(f"[{index}/{total}] Error updating transaction DMTPX_ID={dmtpx_id} (TRX_DATETIME={trx_dt}): {e}")
+                try:
+                    conn.rollback()
+                except Exception as rb_err:
+                    logger.warning(f"[{index}/{total}] Rollback failed for DMTPX_ID={dmtpx_id}: {rb_err}")
+        logger.info(
+            f"Update summary (Toll DB): total={total}, updated={updated_count}, "
+            f"no_match={notfound_count}, failed={failed_count}."
+        )
+        if failed_count:
+            logger.warning(f"{failed_count} transaction(s) failed to update in the Toll database.")
 
     except Exception as e:
         logger.error(f"Error updating transaction: {e}")
@@ -339,6 +423,11 @@ def main(config, dry_run=False):
             for promotion in promotions
         }
 
+        logger.info(
+            f"Fetched {len(transactions)} transaction(s) from Toll DB and "
+            f"{len(promotions)} active promotion(s) ({len(promotion_keys)} unique plate/province key(s))."
+        )
+
         # Match transactions with promotions
         matched_transactions = []
         for transaction in transactions:
@@ -349,6 +438,11 @@ def main(config, dry_run=False):
                     f"Promotion found for licence plate {transaction.DMTPX_LICENCEPLATE} in province {transaction.DMTPX_PROVINCE} in transaction {transaction.DMTPX_ID}."
                 )
                 matched_transactions.append(transaction)
+
+        logger.info(
+            f"Matching complete: {len(matched_transactions)} of {len(transactions)} "
+            f"transaction(s) matched an active promotion."
+        )
 
         if dry_run:
             # Dry-run mode: export to CSV instead of writing to the databases.
@@ -375,18 +469,38 @@ def main(config, dry_run=False):
             return
 
         # Insert matched transactions into Promotion Toll DB
+        inserted_ok = []
         if matched_transactions:
             logger.info(f"Inserting {len(matched_transactions)} matched transactions into the Promotion Toll database.")
-            insert_Toll_Transactions(config.get('Promotion_DB'), matched_transactions)
-            for t in matched_transactions:
+            inserted_ok = insert_Toll_Transactions(config.get('Promotion_DB'), matched_transactions)
+            for t in inserted_ok:
                 logger.debug(f"Transaction {t.DMTPX_ID} updated with promotion details.")
         else:
             logger.info("No matched transactions to insert into the Promotion Toll database.")
 
-        # Update the original transactions in the Toll database
-        if transactions:
-            logger.info(f"Updating {len(transactions)} transactions in the Toll database.")
-            update_Toll_Transactions(config.get('Toll_DB'), transactions)
+        # Work out which matched transactions failed to insert. Those must NOT
+        # be marked as processed in the Toll DB, otherwise they would never be
+        # picked up (and inserted) again on a later run.
+        inserted_ids = {t.ID for t in inserted_ok}
+        failed_ids = {t.ID for t in matched_transactions} - inserted_ids
+        if failed_ids:
+            logger.warning(
+                f"{len(failed_ids)} matched transactions failed to insert into the Promotion "
+                f"Toll database and will NOT be marked as processed (will retry next run)."
+            )
+
+        # Update the original transactions in the Toll database, skipping the
+        # matched ones that failed to insert above.
+        transactions_to_update = [t for t in transactions if t.ID not in failed_ids]
+        skipped = len(transactions) - len(transactions_to_update)
+        logger.info(
+            f"Preparing Toll DB update: {len(transactions_to_update)} transaction(s) will be marked as processed, "
+            f"{skipped} skipped due to failed insert."
+        )
+        if transactions_to_update:
+            update_Toll_Transactions(config.get('Toll_DB'), transactions_to_update)
+        else:
+            logger.info("No transactions to update in the Toll database.")
 
         logger.info("All transactions processed successfully.")
     except Exception as e:
